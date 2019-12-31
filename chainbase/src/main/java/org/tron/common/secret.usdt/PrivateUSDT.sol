@@ -1,4 +1,5 @@
 pragma solidity ^0.4.0;
+pragma experimental ABIEncoderV2;
 
 import "./MerkleTree.sol";
 import "./USDTToken.sol";
@@ -17,75 +18,107 @@ contract PrivateUSDT {
         usdtToken = USDTToken(_USDToken);
     }
 
-    struct SpendDescription {
-        bytes32[] value_commitment;
+    struct SpendDescription {//384 bytes
+        bytes32 value_commitment;
         bytes32 anchor;
         bytes32 nullifier;
-        bytes[] rk;
-        bytes32[] spend_auth_sig;
-        bytes32[] proof;
+        bytes32 rk;
+        byte[64] spend_auth_sig;//64 bytes
+        byte[192] proof; //192 bytes
     }
 
     struct OutputDescription {
-        bytes32[] value_commitment;
-        bytes32[] note_commitment;
-        bytes32[] epk;
-        bytes32 [] proof;
-        bytes32[] c_enc;
-        bytes32[] c_out;
+        bytes32 value_commitment;
+        bytes32 note_commitment;
+        bytes32 epk;
+        byte[192] proof;
+        byte[580] c_enc;
+        byte[80] c_out;
     }
 
-    address verifyProofContract = address(0x1000F);
-
-    function computeMessageHash(uint256[] memory inputs) internal pure returns (bytes32) {
-        bytes32 hash = keccak256(abi.encodePacked(inputs));
-        return hash;
+    struct OutputDescriptionWithoutC {//288 bytes
+        bytes32 value_commitment;
+        bytes32 note_commitment;
+        bytes32 epk;
+        byte[192] proof;
     }
 
-    function mint(uint128 value, OutputDescription calldata outputDescription, bytes32[] calldata bindingSignature) external {
+    address verifyProofContract = address(0x000F);
+
+    function mint(uint64 value, OutputDescription calldata outputDescription, bytes32[] calldata bindingSignature) external {
         require(value > 0, "Mint negative value.");
-        bytes32 signHash = computeMessageHash(Concatenate(address(this), msg.sender, value, outputDescription));
-        bool result = verifyProofContract.call(abi.encode(Mint, null, outputDescription, bindingSignature, value, signHash));
+        bytes32 signHash = keccak256(abi.encodePacked(address(this), msg.sender, value, outputDescription));
+
+        OutputDescriptionWithoutC outputDescriptionWithoutC = OutputDescriptionWithoutC ({
+            value_commitment: outputDescription.valuement,
+            note_commitment: outputDescription.note_commitment,
+            epk: outputDescription.epk,
+            proof: outputDescription.proof
+        });
+        //416 = 288 + 64 + "32" + 32
+        bool result = verifyProofContract.call(abi.encode(outputDescriptionWithoutC, bindingSignature, value, signHash));
         require(result, "The proof and signature have not been verified by the contract");
+
+        // update contract states
+        bytes32 commitment= outputDescription.note_commitment;
+        latestRoot = insertLeaf(commitment); // recalculate the root of the merkleTree as it's now different
+        roots[latestRoot] = latestRoot; // and save the new root to the list of roots
+
         // Finally, transfer the fTokens from the sender to this contract
         usdtToken.transferFrom(msg.sender, address(this), value);
     }
 
 
     function transfer(SpendDescription calldata spendDescription, OutputDescription[] calldata outputDescription, byte32[] calldata bindingSignature) external {
-        require(roots[spendDescription.anchor] == spendDescription.anchor, "The input root has never been the root of the Merkle Tree");
-        require(nullifiers[spendDescription.nullifier] == 0, "The commitment being spent (commitmentF) has already been nullified!");
-        require(outputDescription[0].note_commitment != outputDescription[1].note_commitment, "The new commitments (commitmentE and commitmentF) must be different!");
 
-        bytes32 signHash = computeMessageHash(Concatenate(address(this), msg.sender, spendDescription, outputDescription));
-        result = verifyProofContract.call(abi.encode(TRANSFER, spendDescription, outputDescription, bindingSignature, valueBalance, signHash));
-        require(result, "The proof has not been verified by the contract");
+        require(roots[spendDescription.anchor] == spendDescription.anchor, "The input root has never been the root of the Merkle Tree");
+        require(nullifiers[spendDescription.nullifier] == 0, "The notecommitment being spent has already been nullified!");
+        require(outputDescription[0].note_commitment != outputDescription[1].note_commitment, "The new notecommitments must be different!");
+
+        bytes32 signHash = keccak256(abi.encodePacked(address(this), msg.sender, spendDescription, outputDescription));
+
+        OutputDescriptionWithoutC outputDescriptionWithoutC0 = OutputDescriptionWithoutC({
+            value_commitment: outputDescription[0].valuement,
+            note_commitment: outputDescription[0].note_commitment,
+            epk: outputDescription[0].epk,
+            proof: outputDescription[0].proof
+            });
+
+        OutputDescriptionWithoutC outputDescriptionWithoutC1 = OutputDescriptionWithoutC({
+            value_commitment: outputDescription[1].valuement,
+            note_commitment: outputDescription[1].note_commitment,
+            epk: outputDescription[1].epk,
+            proof: outputDescription[1].proof
+            });
+
+        //1056 = 384 + 288 + 288 + 64 + 32
+        result = verifyProofContract.call(abi.encode(spendDescription, outputDescriptionWithoutC0, outputDescriptionWithoutC1, bindingSignature, signHash));
+        require(result, "The proof and signature has not been verified by the contract");
 
         bytes32[] memory leaves = new bytes32[](2);
-        leaves[0] = _commitmentE;
-        leaves[1] = _commitmentF;
+        leaves[0] = outputDescriptionWithoutC0.note_commitment;
+        leaves[1] = outputDescriptionWithoutC1.note_commitment;
 
         latestRoot = insertLeaves(leaves); // recalculate the root of the merkleTree as it's now different
         roots[latestRoot] = latestRoot; // and save the new root to the list of roots
 
-        emit Transfer(_nullifierC, _nullifierD);
     }
 
 
-    function burn(SpendDescription calldata spendDescription, uint256 payTo, uint128 value, bytes32[] calldata binding_signature) external {
+    function burn(SpendDescription calldata spendDescription, uint256 payTo, uint64 value, bytes32[] calldata binding_signature) external {
+
         require(value > 0, "Mint negative value.");
         require(roots[spendDescription.anchor] == spendDescription.anchor, "The input root has never been the root of the Merkle Tree");
-        require(nullifiers[spendDescription.nullifier] == 0, "The commitment being spent (commitmentF) has already been nullified!");
+        require(nullifiers[spendDescription.nullifier] == 0, "The notecommitment being spent has already been nullified!");
 
-        bytes32 signHash = computeMessageHash(Concatenate(address(this), msg.sender, spendDescription, payTo, value));
-        bool result = verifyProofContract.call(abi.encode(transferType, spendDescription, outputDescription, bindingSignature, valueBalance, signHash));
+        bytes32 signHash = keccak256(abi.encodePacked(address(this), msg.sender, spendDescription, payTo, value));
+        // 512 = 384 + 64 + 32 + 32
+        bool result = verifyProofContract.call(abi.encode(spendDescription, bindingSignature, value, signHash));
         require(result, "The proof and signature have not been verified by the contract");
 
-        //Finally, transfer the fungible tokens from this contract to the nominated address
+        //Finally, transfer USDT from this contract to the nominated address
         address payToAddress = address(payTo);
         usdtToken.transfer(payToAddress, value);
-
-        emit Burn(_nullifier);
     }
 
 }

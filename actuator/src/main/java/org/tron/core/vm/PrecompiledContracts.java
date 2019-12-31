@@ -67,6 +67,24 @@ import org.tron.core.vm.program.Program;
 import org.tron.core.vm.repository.Repository;
 import org.tron.protos.Protocol.Permission;
 
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import org.apache.commons.collections4.CollectionUtils;
+import org.tron.common.utils.DecodeUtil;
+import org.tron.common.zksnark.JLibrustzcash;
+import org.tron.common.zksnark.LibrustzcashParam.CheckOutputParams;
+import org.tron.common.zksnark.LibrustzcashParam.CheckSpendParams;
+import org.tron.common.zksnark.LibrustzcashParam.FinalCheckParams;
+import org.tron.core.exception.ContractExeException;
+import org.tron.core.exception.ContractValidateException;
+import org.tron.core.exception.ZkProofValidateException;
+import org.tron.core.exception.ZksnarkException;
+import org.tron.protos.contract.ShieldContract.ReceiveDescription;
+import org.tron.protos.contract.ShieldContract.ShieldedTransferContract;
+import org.tron.protos.contract.ShieldContract.SpendDescription;
+
+
 /**
  * @author Roman Mandeleil
  * @since 09.01.2015
@@ -86,6 +104,8 @@ public class PrecompiledContracts {
 
   private static final BatchValidateSign batchValidateSign = new BatchValidateSign();
   private static final ValidateMultiSign validateMultiSign = new ValidateMultiSign();
+  private static final ValidateProof validateProof = new ValidateProof();
+
 
 
   private static final DataWord ecRecoverAddr = new DataWord(
@@ -108,6 +128,8 @@ public class PrecompiledContracts {
       "0000000000000000000000000000000000000000000000000000000000000009");
   private static final DataWord validateMultiSignAddr = new DataWord(
       "000000000000000000000000000000000000000000000000000000000000000a");
+  private static final DataWord validateProofAddr = new DataWord(
+      "000000000000000000000000000000000000000000000000000000000000000F");
 
   public static PrecompiledContract getContractForAddress(DataWord address) {
 
@@ -144,6 +166,9 @@ public class PrecompiledContracts {
     }
     if (VMConfig.allowTvmSolidity059() && address.equals(validateMultiSignAddr)) {
       return validateMultiSign;
+    }
+    if (address.equals(validateProofAddr)) {
+      return validateProof;
     }
 
     return null;
@@ -857,6 +882,222 @@ public class PrecompiledContracts {
       private int nonce;
     }
 
+
+  }
+
+  /**
+   * Computes pairing check. <br/> See {@link PairingCheck} for details.<br/> <br/>
+   *
+   * Input data[]: <br/> an array of points (a1, b1, ... , ak, bk), <br/> where "ai" is a point of
+   * {@link BN128Fp} curve and encoded as two 32-byte left-padded integers (x; y) <br/> "bi" is a
+   * point of {@link BN128G2} curve and encoded as four 32-byte left-padded integers {@code (ai + b;
+   * ci + d)}, each coordinate of the point is a big-endian {@link } number, so {@code b} precedes
+   * {@code a} in the encoding: {@code (b, a; d, c)} <br/> thus each pair (ai, bi) has 192 bytes
+   * length, if 192 is not a multiple of {@code data.length} then execution fails <br/> the number
+   * of pairs is derived from input length by dividing it by 192 (the length of a pair) <br/> <br/>
+   *
+   * output: <br/> pairing product which is either 0 or 1, encoded as 32-byte left-padded integer
+   * <br/>
+   */
+  public static class ValidateProof extends PrecompiledContract {
+
+    //outputDescriptionWithoutC, bindingSignature, value, signHash
+    private static final int MINT_SIZE = 416;
+    //spendDescription, receiveDescriptionWithoutC0, receiveDescriptionWithoutC1, bindingSignature, signHash
+    private static final int TRANSFER_SIZE = 1056;
+    //spendDescription, bindingSignature, value, signHash
+    private static final int BURN_SIZE = 512;
+
+    @Override
+    public long getEnergyForData(byte[] data) {
+
+        return 0;
+
+    }
+
+    @Override
+    public Pair<Boolean, byte[]> execute(byte[] data) {
+
+      if (data == null) {
+        return Pair.of(false, EMPTY_BYTE_ARRAY);
+      }
+      boolean result;
+      // fail if input len is not a multiple of PAIR_SIZE
+      switch (data.length) {
+        case MINT_SIZE:
+          result = checkMint(data);
+          break;
+        case TRANSFER_SIZE:
+          result = checkTransfer(data);
+          break;
+        case BURN_SIZE:
+          result = checkBurn(data);
+          break;
+        default:
+          result = false;
+      }
+
+      return Pair.of(result, EMPTY_BYTE_ARRAY);
+    }
+
+    //data: outputDescriptionWithoutC, bindingSignature, value, signHash
+    private boolean checkMint(byte[] data) {
+      byte[] cv = new byte[32];
+      byte[] cm = new byte[32];
+      byte[] epk = new byte[32];
+      byte[] proof = new byte[192];
+      byte[] bindingSig = new byte[64];
+      byte[] signHash = new byte[32];
+
+      System.arraycopy(data, 0, cv, 0, 32);
+      System.arraycopy(data, 32, cm, 0, 32);
+      System.arraycopy(data, 64, epk, 0, 32);
+      System.arraycopy(data, 96, proof, 0, 192);
+      System.arraycopy(data, 288, bindingSig, 0, 64);
+      long value = parseLong(data, 352);
+      System.arraycopy(data, 384, signHash, 0, 32);
+
+      boolean result;
+
+      //verify receiveProof && bindingSignature
+      long ctx = JLibrustzcash.librustzcashSaplingVerificationCtxInit();
+      try {
+        result = JLibrustzcash.librustzcashSaplingCheckOutput(
+                new CheckOutputParams(ctx, cv, cm, epk, proof));
+
+        long valueBalance = -value;
+
+        result  &= JLibrustzcash.librustzcashSaplingFinalCheck(
+                new FinalCheckParams(ctx, valueBalance, bindingSig, signHash));
+
+      }catch (Throwable any) {
+        result = false;
+      } finally {
+        JLibrustzcash.librustzcashSaplingVerificationCtxFree(ctx);
+      }
+
+      return result;
+
+    }
+
+    //data: spendDescription, outputDescriptionWithoutC0, outputDescriptionWithoutC1, bindingSignature, signHash
+    private boolean checkTransfer(byte[] data) {
+      //spend
+      byte[] spendCv = new byte[32];
+      byte[] anchor = new byte[32];
+      byte[] nullifier = new byte[32];
+      byte[] rk = new byte[32];
+      byte[] spendAuthSig = new byte[64];
+      byte[] spendProof = new byte[192];
+      //receive0
+      byte[] receiveCv0 = new byte[32];
+      byte[] receiveCm0 = new byte[32];
+      byte[] receiveEpk0 = new byte[32];
+      byte[] receiveProof0 = new byte[192];
+      //receive1
+      byte[] receiveCv1 = new byte[32];
+      byte[] receiveCm1 = new byte[32];
+      byte[] receiveEpk1 = new byte[32];
+      byte[] receiveProof1 = new byte[192];
+
+      byte[] bindingSig = new byte[64];
+      byte[] signHash = new byte[32];
+      //spend
+      System.arraycopy(data, 0, spendCv, 0, 32);
+      System.arraycopy(data, 32, anchor, 0, 32);
+      System.arraycopy(data, 64, nullifier, 0, 32);
+      System.arraycopy(data, 96, rk, 0, 32);
+      System.arraycopy(data, 128, spendAuthSig, 0, 64);
+      System.arraycopy(data, 192, spendProof, 0, 192);
+      //receive0
+      System.arraycopy(data, 384, receiveCv0, 0, 32);
+      System.arraycopy(data, 416, receiveCm0, 0, 32);
+      System.arraycopy(data, 448, receiveEpk0, 0, 32);
+      System.arraycopy(data, 480, receiveProof0, 0, 192);
+      //receive1
+      System.arraycopy(data, 672, receiveCv1, 0, 32);
+      System.arraycopy(data, 704, receiveCm1, 0, 32);
+      System.arraycopy(data, 736, receiveEpk1, 0, 32);
+      System.arraycopy(data, 768, receiveProof1, 0, 192);
+
+      System.arraycopy(data, 960, bindingSig, 0, 64);
+      System.arraycopy(data, 1024, signHash, 0, 32);
+
+      boolean result;
+
+      //verify spendProof, receiveProof && bindingSignature
+      long ctx = JLibrustzcash.librustzcashSaplingVerificationCtxInit();
+      try {
+        result = JLibrustzcash.librustzcashSaplingCheckSpend(
+                new CheckSpendParams(ctx, spendCv, anchor, nullifier, rk, spendProof, spendAuthSig, signHash));
+
+        result &= JLibrustzcash.librustzcashSaplingCheckOutput(
+                new CheckOutputParams(ctx, receiveCv0, receiveCm0, receiveEpk0, receiveProof0));
+
+        result &= JLibrustzcash.librustzcashSaplingCheckOutput(
+                new CheckOutputParams(ctx, receiveCv1, receiveCm1, receiveEpk1, receiveProof1));
+
+        result  &= JLibrustzcash.librustzcashSaplingFinalCheck(
+                new FinalCheckParams(ctx, 0, bindingSig, signHash));
+
+      }catch (Throwable any) {
+        result = false;
+      } finally {
+        JLibrustzcash.librustzcashSaplingVerificationCtxFree(ctx);
+      }
+
+      return result;
+
+    }
+
+    //data: spendDescription, bindingSignature, value, signHash
+    private boolean checkBurn(byte[] data) {
+      //spend
+      byte[] cv = new byte[32];
+      byte[] anchor = new byte[32];
+      byte[] nullifier = new byte[32];
+      byte[] rk = new byte[32];
+      byte[] spendAuthSig = new byte[64];
+      byte[] proof = new byte[192];
+
+      byte[] bindingSig = new byte[64];
+      byte[] signHash = new byte[32];
+      //spend
+      System.arraycopy(data, 0, cv, 0, 32);
+      System.arraycopy(data, 32, anchor, 0, 32);
+      System.arraycopy(data, 64, nullifier, 0, 32);
+      System.arraycopy(data, 96, rk, 0, 32);
+      System.arraycopy(data, 128, spendAuthSig, 0, 64);
+      System.arraycopy(data, 192, proof, 0, 192);
+      System.arraycopy(data, 384, bindingSig, 0, 64);
+      long value = parseLong(data, 448);
+      System.arraycopy(data, 480, signHash, 0, 32);
+
+      boolean result;
+
+      //verify spendProof && bindingSignature
+      long ctx = JLibrustzcash.librustzcashSaplingVerificationCtxInit();
+      try {
+        result = JLibrustzcash.librustzcashSaplingCheckSpend(
+                new CheckSpendParams(ctx, cv, anchor, nullifier, rk, proof, spendAuthSig, signHash));
+        long valueBalance = value;
+        result  &= JLibrustzcash.librustzcashSaplingFinalCheck(
+                new FinalCheckParams(ctx, valueBalance, bindingSig, signHash));
+
+      }catch (Throwable any) {
+        result = false;
+      } finally {
+        JLibrustzcash.librustzcashSaplingVerificationCtxFree(ctx);
+      }
+
+      return result;
+
+    }
+
+    private long parseLong(byte[] data, int idx) {
+      byte[] bytes = parseBytes(data, idx, 32);
+      return new DataWord(bytes).longValueSafe();
+    }
 
   }
 
